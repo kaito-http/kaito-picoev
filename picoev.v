@@ -38,6 +38,9 @@ pub mut:
 	cb      fn (int, int, voidptr) = unsafe { nil }
 	// used internally by the kqueue implementation
 	backend int
+	// Store request and response for streaming
+	request ?&picohttpparser.Request
+	response ?&picohttpparser.Response
 }
 
 // Config configures the Picoev instance with server settings and callbacks
@@ -246,6 +249,38 @@ fn raw_callback(fd int, events int, context voidptr) {
 			pv.raw_callback(mut pv, fd, events)
 			return
 		}
+
+		mut target := pv.file_descriptors[fd]
+		
+		// If we have an existing request, try to read more body data
+		if req := target.request {
+			if mut reader := req.get_body_reader() {
+				mut buf := []u8{len: 1024}
+				n := reader.read(mut buf) or {
+					if err.msg() == 'EAGAIN' {
+						// Need more data, keep waiting
+						return
+					}
+					if err.msg() == 'EOF' {
+						// Done reading
+						pv.close_conn(fd)
+						return
+					}
+					// Error reading
+					if res := target.response {
+						res.status(400)
+						res.body('{"error":"Failed to read body: ${err}"}')
+						res.end()
+					}
+					pv.close_conn(fd)
+					return
+				}
+				println('Read ${n} bytes from body')
+				return
+			}
+		}
+
+		// No existing request, create a new one
 		mut request_buffer := pv.buf
 		unsafe {
 			request_buffer += fd * pv.max_read // pointer magic
@@ -262,49 +297,45 @@ fn raw_callback(fd int, events int, context voidptr) {
 			buf:       response_buffer
 			date:      pv.date.str
 		}
-		for {
-			// Request parsing loop
-			r := req_read(fd, request_buffer, pv.max_read, pv.idx[fd]) // Get data from socket
-			if r == 0 {
-				// connection closed by peer
-				pv.close_conn(fd)
-				return
-			} else if r == -1 {
-				if fatal_socket_error(fd) == false {
-					return
-				}
-				elog('Error during req_read')
-				// fatal error
-				pv.close_conn(fd)
+
+		// Read and parse headers
+		r := req_read(fd, request_buffer, pv.max_read, pv.idx[fd])
+		if r == 0 {
+			// connection closed by peer
+			pv.close_conn(fd)
+			return
+		} else if r == -1 {
+			if fatal_socket_error(fd) == false {
 				return
 			}
-			pv.idx[fd] += r
-			mut s := unsafe { tos(request_buffer, pv.idx[fd]) }
-			pret := req.parse_request(s) or {
-				// Parse error
-				pv.error_callback(pv.user_data, req, mut &res, err)
-				return
-			}
-			if pret > 0 { // Success - headers are parsed
-				// Create body reader if needed
-				if body_reader := req.create_body_reader(fd) {
-					req.body_reader = body_reader
-				}
-				// Keep connection alive for streaming
-				pv.set_timeout(fd, pv.timeout_secs)
-				break
-			}
-			assert pret == -2
-			// request is incomplete, continue the loop
-			if pv.idx[fd] == sizeof(request_buffer) {
-				pv.error_callback(pv.user_data, req, mut &res, error('RequestIsTooLongError'))
-				return
-			}
+			elog('Error during req_read')
+			pv.close_conn(fd)
+			return
 		}
-		// Switch to write mode for response
-		pv.update_events(fd, picoev_write) // TODO: Remove..? Maybe..?
-		// Callback (should call .end() itself)
-		pv.cb(pv.user_data, req, mut &res)
+		pv.idx[fd] += r
+		mut s := unsafe { tos(request_buffer, pv.idx[fd]) }
+		pret := req.parse_request(s) or {
+			pv.error_callback(pv.user_data, req, mut &res, err)
+			return
+		}
+		if pret > 0 { // Success - headers are parsed
+			// Create body reader if needed
+			if body_reader := req.create_body_reader(fd) {
+				req.body_reader = body_reader
+				// Store request and response for future read events
+				target.request = &req
+				target.response = &res
+			}
+			// Call callback with the request
+			pv.cb(pv.user_data, req, mut &res)
+			return
+		}
+		assert pret == -2
+		// request is incomplete, continue reading
+		if pv.idx[fd] == sizeof(request_buffer) {
+			pv.error_callback(pv.user_data, req, mut &res, error('RequestIsTooLongError'))
+			return
+		}
 	} else if events & picoev_write != 0 {
 		pv.set_timeout(fd, pv.timeout_secs)
 		if !isnil(pv.raw_callback) {

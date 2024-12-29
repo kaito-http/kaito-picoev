@@ -263,7 +263,7 @@ fn raw_callback(fd int, events int, context voidptr) {
 			date:      pv.date.str
 		}
 		for {
-			// Request parsing loop
+			// Request parsing loop - only parse headers
 			r := req_read(fd, request_buffer, pv.max_read, pv.idx[fd]) // Get data from socket
 			if r == 0 {
 				// connection closed by peer
@@ -286,11 +286,14 @@ fn raw_callback(fd int, events int, context voidptr) {
 				return
 			}
 			if pret > 0 { // Success - headers are parsed
-				// Always try to create a body reader for the request
-				req.create_body_reader(fd) or {}
+				// Create body reader if needed, but don't read the body
+				// Store the result of create_body_reader directly in the request
+				req.body_reader = req.create_body_reader(fd)
 				// Keep connection alive for streaming
 				pv.set_timeout(fd, pv.timeout_secs)
-				break
+				// Call user's callback exactly once after headers are parsed
+				pv.cb(pv.user_data, req, mut &res)
+				return
 			}
 			assert pret == -2
 			// request is incomplete, continue the loop
@@ -299,8 +302,6 @@ fn raw_callback(fd int, events int, context voidptr) {
 				return
 			}
 		}
-		// Callback (should call .end() itself)
-		pv.cb(pv.user_data, req, mut &res)
 	} else if events & picoev_write != 0 {
 		pv.set_timeout(fd, pv.timeout_secs)
 		if !isnil(pv.raw_callback) {

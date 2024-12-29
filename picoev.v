@@ -286,8 +286,10 @@ fn raw_callback(fd int, events int, context voidptr) {
 				return
 			}
 			if pret > 0 { // Success - headers are parsed
-				// Always try to create a body reader for the request
-				req.create_body_reader(fd) or {}
+				// Create body reader if needed
+				if body_reader := req.create_body_reader(fd) {
+					req.body_reader = body_reader
+				}
 				// Keep connection alive for streaming
 				pv.set_timeout(fd, pv.timeout_secs)
 				break
@@ -299,6 +301,8 @@ fn raw_callback(fd int, events int, context voidptr) {
 				return
 			}
 		}
+		// Switch to write mode for response
+		pv.update_events(fd, picoev_write) // TODO: Remove..? Maybe..?
 		// Callback (should call .end() itself)
 		pv.cb(pv.user_data, req, mut &res)
 	} else if events & picoev_write != 0 {
@@ -307,6 +311,8 @@ fn raw_callback(fd int, events int, context voidptr) {
 			pv.raw_callback(mut pv, fd, events)
 			return
 		}
+		// After write is done, close the connection
+		pv.close_conn(fd)
 	}
 }
 

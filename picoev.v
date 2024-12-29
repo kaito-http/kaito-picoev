@@ -49,6 +49,19 @@ pub mut:
 	chunked      bool
 }
 
+// reset_for_next_request resets the connection state for the next request
+fn (mut cs ConnectionState) reset_for_next_request() {
+	cs.phase = .headers
+	cs.content_len = 0
+	cs.bytes_read = 0
+	cs.chunked = false
+	cs.buffer_len = 0
+	cs.req.body = ''
+	if cs.req.body_reader != unsafe { nil } {
+		cs.req.body_reader.clear_leftover()
+	}
+}
+
 // Target is a data representation of everything that needs to be associated with a single
 // file descriptor (connection)
 pub struct Target {
@@ -274,16 +287,13 @@ pub fn (mut pv Picoev) close_conn(fd int) {
 fn raw_callback(fd int, events int, context voidptr) {
 	mut pv := unsafe { &Picoev(context) }
 	mut target := pv.file_descriptors[fd]
-	eprintln('raw_callback: fd=${fd} events=${events}')
 	
 	if target == unsafe { nil } {
-		eprintln('target is nil, closing connection')
 		pv.close_conn(fd)
 		return
 	}
 
 	if events & picoev_timeout != 0 {
-		eprintln('timeout event for fd=${fd}')
 		trace_fd('timeout ${fd}')
 		if !isnil(pv.raw_callback) {
 			pv.raw_callback(mut pv, fd, events)
@@ -295,7 +305,6 @@ fn raw_callback(fd int, events int, context voidptr) {
 		pv.close_conn(fd)
 		return
 	} else if events & picoev_read != 0 {
-		eprintln('read event for fd=${fd}')
 		pv.set_timeout(fd, pv.timeout_secs)
 		if !isnil(pv.raw_callback) {
 			pv.raw_callback(mut pv, fd, events)
@@ -304,7 +313,6 @@ fn raw_callback(fd int, events int, context voidptr) {
 
 		mut cs := target.state
 		if cs == unsafe { nil } {
-			eprintln('connection state is nil, closing connection')
 			pv.close_conn(fd)
 			return
 		}
@@ -316,28 +324,22 @@ fn raw_callback(fd int, events int, context voidptr) {
 		for {
 			available := cs.buffer.len - cs.buffer_len
 			if available <= 0 {
-				eprintln('buffer is full')
 				// Buffer is full - we need to process what we have first
 				break
 			}
 
 			r := req_read(fd, &cs.buffer[cs.buffer_len], available, 0)
-			eprintln('read ${r} bytes')
 			if r == 0 {
 				// connection closed by peer
-				eprintln('connection closed by peer')
 				cs.phase = .ended
 				pv.close_conn(fd)
 				return
 			} else if r == -1 {
 				if fatal_socket_error(fd) == false {
-					eprintln('would block, breaking read loop')
 					// Non-fatal error: EAGAIN or EWOULDBLOCK
 					would_block = true
 					break
 				}
-				// fatal error
-				eprintln('fatal socket error')
 				cs.phase = .errored
 				had_error = true
 				break
@@ -353,14 +355,12 @@ fn raw_callback(fd int, events int, context voidptr) {
 
 			// If we're done or errored, stop reading
 			if cs.phase == .ended || cs.phase == .errored {
-				eprintln('request phase ${cs.phase}, breaking read loop')
 				break
 			}
 		}
 
 		// Handle any data we've read before closing on error
 		if cs.buffer_len > 0 {
-			eprintln('Processing remaining ${cs.buffer_len} bytes')
 			match cs.phase {
 				.headers { parse_headers_phase(mut cs, mut pv) }
 				.body { parse_body_phase(mut cs, mut pv) }
@@ -490,60 +490,48 @@ fn parse_headers_phase(mut cs ConnectionState, mut pv Picoev) {
 			cs.buffer_len = 0
 		}
 
-		// Check if content-length is zero → no body
+		// Create BodyReader with leftover if needed
+		if cs.content_len > 0 || cs.chunked {
+			mut br := &picohttpparser.BodyReader{
+				fd: req.fd
+				content_length: cs.content_len
+				chunked: cs.chunked
+			}
+			br.set_leftover(cs.buffer[..cs.buffer_len])
+			req.body_reader = br
+			cs.buffer_len = 0
+		}
+
+		// If no body, or content_len==0 without chunked, we can mark ended
 		if cs.content_len == 0 && !cs.chunked {
 			cs.phase = .ended
-			// Call the user callback with the complete request
-			pv.cb(pv.user_data, req, mut cs.res)
-			if cs.res.end() < 0 {
-				eprintln('Failed to send response')
+		}
+
+		// Call the user callback, letting them handle reading the body if any
+		pv.cb(pv.user_data, req, mut cs.res)
+
+		// After callback, check if we should keep alive
+		if cs.phase == .ended {
+			if req.client_wants_keep_alive() {
+				// Reset for next request
+				cs.reset_for_next_request()
+			} else {
+				pv.close_conn(req.fd)
 			}
-			pv.close_conn(req.fd)
 		}
 	}
 }
 
 // parse_body_phase handles reading the HTTP request body
 fn parse_body_phase(mut cs ConnectionState, mut pv Picoev) {
-	mut req := cs.req
-	if cs.chunked {
-		// TODO: Implement chunked transfer encoding
-		// For now, treat as error
-		cs.phase = .errored
-		pv.error_callback(pv.user_data, req, mut cs.res, error('Chunked transfer encoding not implemented'))
-		if cs.res.end() < 0 {
-			eprintln('Failed to send error response')
-		}
-		pv.close_conn(req.fd)
-		return
-	} else {
-		// content-length approach
-		if cs.content_len > 0 {
-			// We have new data in cs.buffer
-			needed := cs.content_len - cs.bytes_read
-			in_buffer := cs.buffer_len
-			to_consume := if u64(in_buffer) > needed { int(needed) } else { in_buffer }
-
-			// Update the request body
-			req.body = unsafe { cs.buffer[..to_consume].bytestr() }
-			cs.bytes_read += u64(to_consume)
-
-			// shift the buffer
-			leftover := cs.buffer_len - to_consume
-			if leftover > 0 {
-				unsafe { C.memmove(&cs.buffer[0], &cs.buffer[to_consume], leftover) }
-			}
-			cs.buffer_len = leftover
-
-			if cs.bytes_read == cs.content_len {
-				cs.phase = .ended
-				// Call the user callback with the complete request
-				pv.cb(pv.user_data, req, mut cs.res)
-				if cs.res.end() < 0 {
-					eprintln('Failed to send response')
-				}
-				pv.close_conn(req.fd)
-			}
+	// Body reading is now handled by BodyReader on demand
+	// This phase is only for state tracking
+	if cs.req.body_reader != unsafe { nil } && cs.req.body_reader.is_closed() {
+		cs.phase = .ended
+		if cs.req.client_wants_keep_alive() {
+			cs.reset_for_next_request()
+		} else {
+			pv.close_conn(cs.req.fd)
 		}
 	}
 }

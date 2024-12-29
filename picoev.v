@@ -208,7 +208,7 @@ fn accept_callback(listen_fd int, events int, cb_arg voidptr) {
 	trace_fd('accept ${accepted_fd}')
 	setup_sock(accepted_fd) or {
 		elog('setup_sock failed, fd: ${accepted_fd}, listen_fd: ${listen_fd}, err: ${err.code()}')
-		pv.error_callback(pv.user_data, picohttpparser.Request{}, mut &picohttpparser.Response{},
+		pv.error_callback(pv.user_data, picohttpparser.Request{fd: accepted_fd}, mut &picohttpparser.Response{},
 			err)
 		close_socket(accepted_fd) // Close fd on failure
 		return
@@ -250,7 +250,7 @@ fn raw_callback(fd int, events int, context voidptr) {
 		unsafe {
 			request_buffer += fd * pv.max_read // pointer magic
 		}
-		mut req := picohttpparser.Request{}
+		mut req := picohttpparser.Request{fd: fd}
 		// Response init
 		mut response_buffer := pv.out
 		unsafe {

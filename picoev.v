@@ -285,7 +285,11 @@ fn raw_callback(fd int, events int, context voidptr) {
 				pv.error_callback(pv.user_data, req, mut &res, err)
 				return
 			}
-			if pret > 0 { // Success
+			if pret > 0 { // Success - headers are parsed
+				// Always try to create a body reader for the request
+				req.create_body_reader(fd) or {}
+				// Keep connection alive for streaming
+				pv.set_timeout(fd, pv.timeout_secs)
 				break
 			}
 			assert pret == -2

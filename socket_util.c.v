@@ -126,8 +126,11 @@ fn listen(config Config) !int {
 	net.socket_error_message(C.bind(fd, voidptr(&addr), alen), 'binding to ${saddr} failed')!
 	net.socket_error_message(C.listen(fd, C.SOMAXCONN), 'listening on ${saddr} with maximum backlog pending queue of ${C.SOMAXCONN}, failed')!
 	setup_sock(fd) or {
-		config.err_cb(config.user_data, picohttpparser.Request{fd: fd}, mut &picohttpparser.Response{},
-			err)
+		mut req := &picohttpparser.Request{
+			fd: fd
+		}
+		config.err_cb(config.user_data, *req, mut &picohttpparser.Response{}, err)
+		return err
 	}
 	return fd
 }
